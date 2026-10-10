@@ -60,26 +60,29 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
-def run_step(model, optimizer, inputs, targets, mode, profile=False):
-    if mode == "forward":
+def precision_context(device, precision):
+    if precision == "bf16":
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def run_step(model, optimizer, inputs, targets, mode, device, precision, profile=False):
+    if mode != "forward":
+        with nvtx_range("zero_grad", profile):
+            optimizer.zero_grad(set_to_none=True)
+
+    with precision_context(device, precision):
         with nvtx_range("forward", profile):
-            model(inputs)
+            logits = model(inputs)
+        if mode != "forward":
+            with nvtx_range("loss", profile):
+                loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1)
+                )
+
+    if mode == "forward":
         return
-
-    with nvtx_range("zero_grad", profile):
-        optimizer.zero_grad(set_to_none=True)
-
-    # logits:  [batch, sequence, vocab]
-    # targets: [batch, sequence]
-    with nvtx_range("forward", profile):
-        logits = model(inputs)
-    with nvtx_range("loss", profile):
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1)
-        )
-    # logits:  [batch x sequence, vocab]
-    # targets: [batch x sequence]
 
     with nvtx_range("backward", profile):
         loss.backward()
@@ -89,11 +92,11 @@ def run_step(model, optimizer, inputs, targets, mode, profile=False):
             optimizer.step()
 
 
-def benchmark(model, optimizer, inputs, targets, mode, device,
+def benchmark(model, optimizer, inputs, targets, mode, device, precision,
               warmup_steps, measurement_steps, profile=False):
     for _ in range(warmup_steps):
         with nvtx_range("warmup_step", profile):
-            run_step(model, optimizer, inputs, targets, mode, profile)
+            run_step(model, optimizer, inputs, targets, mode, device, precision, profile)
             synchronize(device)
 
     times_ms = []
@@ -104,7 +107,7 @@ def benchmark(model, optimizer, inputs, targets, mode, device,
 
         # Nsight captures this range, so setup and warmup stay outside the trace.
         with nvtx_range("measured_step", profile):
-            run_step(model, optimizer, inputs, targets, mode, profile)
+            run_step(model, optimizer, inputs, targets, mode, device, precision, profile)
             synchronize(device)
         elapsed_ms = (timeit.default_timer() - start) * 1000
         times_ms.append(elapsed_ms)
@@ -126,6 +129,12 @@ def main():
         "--mode",
         choices=[*MODES, "all"],
         default="all",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "bf16", "both"],
+        default="fp32",
+        help="Benchmark full precision, BF16 autocasting, or both",
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--context-length", type=int, default=512)
@@ -159,43 +168,50 @@ def main():
     else:
         modes_to_run = (args.mode,)
 
+    if args.precision == "both":
+        precisions_to_run = ("fp32", "bf16")
+    else:
+        precisions_to_run = (args.precision,)
+
     if args.profile:
         add_attention_nvtx_ranges()
 
     for model_size in args.model_sizes:
         config = MODEL_CONFIGS[model_size]
 
-        for mode in modes_to_run:
-            torch.manual_seed(0)
+        for precision in precisions_to_run:
+            for mode in modes_to_run:
+                torch.manual_seed(0)
 
-            model = BasicsTransformerLM(
-                vocab_size=vocab_size,
-                context_length=args.context_length,
-                d_model=config["d_model"],
-                num_layers=config["num_layers"],
-                num_heads=config["num_heads"],
-                d_ff=config["d_ff"]
-            ).to(device)
+                model = BasicsTransformerLM(
+                    vocab_size=vocab_size,
+                    context_length=args.context_length,
+                    d_model=config["d_model"],
+                    num_layers=config["num_layers"],
+                    num_heads=config["num_heads"],
+                    d_ff=config["d_ff"]
+                ).to(device)
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-            print(f"Running {model_size}, mode={mode} ...", flush=True)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+                print(f"Running {model_size}, precision={precision}, mode={mode} ...", flush=True)
 
-            average_ms, standard_deviation_ms = benchmark(
-                model,
-                optimizer,
-                inputs,
-                targets,
-                mode,
-                device,
-                args.warmup_steps,
-                args.measurement_steps,
-                args.profile,
-            )
+                average_ms, standard_deviation_ms = benchmark(
+                    model,
+                    optimizer,
+                    inputs,
+                    targets,
+                    mode,
+                    device,
+                    precision,
+                    args.warmup_steps,
+                    args.measurement_steps,
+                    args.profile,
+                )
 
-            print(
-                f"{model_size:>6} | {mode:>16} | "
-                f"mean = {average_ms:.2f} ms | std = {standard_deviation_ms:.2f} ms"
-            )
+                print(
+                    f"{model_size:>6} | {precision:>4} | {mode:>16} | "
+                    f"mean = {average_ms:.2f} ms | std = {standard_deviation_ms:.2f} ms"
+                )
 
 if __name__ == "__main__":
     main()
